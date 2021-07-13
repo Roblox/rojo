@@ -1,12 +1,15 @@
 //! Defines Rojo's HTTP API, all under /api. These endpoints generally return
 //! JSON.
 
-use std::{collections::HashMap, fs, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use futures::{Future, Stream};
 
+use fs_err as fs;
 use hyper::{service::Service, Body, Method, Request, StatusCode};
-use rbx_dom_weak::types::Ref;
+use rbx_dom_weak::{types::Ref, InstanceBuilder, WeakDom};
+use roblox_install::RobloxStudio;
+use uuid::Uuid;
 
 use crate::{
     serve_session::ServeSession,
@@ -19,7 +22,10 @@ use crate::{
         },
         util::{json, json_ok},
     },
+    web_api::{CreateAssetsRequest, CreateAssetsResponse},
 };
+
+const CREATE_ASSETS_DIR: &str = "rojo-exports";
 
 pub struct ApiService {
     serve_session: Arc<ServeSession>,
@@ -44,6 +50,7 @@ impl Service for ApiService {
             }
 
             (&Method::POST, "/api/write") => self.handle_api_write(request),
+            (&Method::POST, "/api/create-assets") => self.handle_api_create_assets(request),
 
             (_method, path) => json(
                 ErrorResponse::not_found(format!("Route not found: {}", path)),
@@ -280,6 +287,118 @@ impl ApiService {
         json_ok(&OpenResponse {
             session_id: self.serve_session.session_id(),
         })
+    }
+
+    fn handle_api_create_assets(&self, request: Request<Body>) -> <Self as Service>::Future {
+        let session_id = self.serve_session.session_id();
+
+        let serve_tree = self.serve_session.tree_handle();
+
+        Box::new(request.into_body().concat2().and_then(move |body| {
+            let serve_tree = serve_tree.lock().expect("Couldn't lock RojoTree mutex");
+
+            let request: CreateAssetsRequest = match serde_json::from_slice(&body) {
+                Ok(request) => request,
+                Err(err) => {
+                    return json(
+                        ErrorResponse::bad_request(format!("Invalid body: {}", err)),
+                        StatusCode::BAD_REQUEST,
+                    );
+                }
+            };
+
+            if request.session_id != session_id {
+                return json(
+                    ErrorResponse::bad_request("Wrong session ID"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+
+            let serve_dom = serve_tree.inner();
+
+            let model_path = format!("{}.rbxmx", Uuid::new_v4().to_simple());
+
+            let studio = match RobloxStudio::locate() {
+                Ok(studio) => studio,
+                Err(error) => {
+                    return json(
+                        ErrorResponse::bad_request(format!(
+                            "Couldn't find Roblox Studio: {}",
+                            error
+                        )),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            };
+
+            let packed_path = studio
+                .content_path()
+                .join(CREATE_ASSETS_DIR)
+                .join(&model_path);
+
+            if let Err(error) =
+                fs::create_dir_all(&packed_path.parent().expect("no parent for packed_path"))
+            {
+                return json(
+                    ErrorResponse::bad_request(format!(
+                        "Couldn't create assets directory: {}",
+                        error
+                    )),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+
+            let mut writer = match fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&packed_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    return json(
+                        ErrorResponse::bad_request(format!(
+                            "Couldn't create assets file: {}",
+                            error
+                        )),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            };
+
+            let export_tree = WeakDom::new(
+                InstanceBuilder::new("Folder")
+                    .with_name("Assets")
+                    .with_children(request.assets.iter().copied().map(|asset_ref| {
+                        let exporting = serve_dom.get_by_ref(asset_ref).unwrap_or_else(|| {
+                            unreachable!(
+                                "Received asset ID for an instance not in our tree ({})",
+                                asset_ref
+                            )
+                        });
+
+                        // Children of instance are not used here, as Rojo has already
+                        // created them, and can place them inside instead.
+                        InstanceBuilder::new(&exporting.class)
+                            .with_name(&exporting.name)
+                            .with_properties(exporting.properties.to_owned())
+                    })),
+            );
+
+            // XML is used instead of binary, as invalid XML files error,
+            // while invalid binary files completely crash Studio.
+            if let Err(error) =
+                rbx_xml::to_writer_default(&mut writer, &export_tree, export_tree.root().children())
+            {
+                return json(
+                    ErrorResponse::bad_request(format!("Couldn't write DOM to file: {}", error)),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+
+            json_ok(&CreateAssetsResponse {
+                url: format!("rbxasset://{}/{}", CREATE_ASSETS_DIR, model_path),
+            })
+        }))
     }
 }
 

@@ -7,8 +7,10 @@ local t = require(script.Parent.Parent.t)
 
 local InstanceMap = require(script.Parent.InstanceMap)
 local PatchSet = require(script.Parent.PatchSet)
+local Promise = require(script.Parent.Parent.Promise)
 local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
+local tryGetObjects = require(script.Parent.tryGetObjects)
 
 local Status = strict("Session.Status", {
 	NotStarted = "NotStarted",
@@ -262,8 +264,13 @@ function ServeSession:__initialSync(rootInstanceId)
 			local unappliedPatch = self.__reconciler:applyPatch(catchUpPatch)
 
 			if not PatchSet.isEmpty(unappliedPatch) then
-				Log.warn("Could not apply all changes requested by the Rojo server:\n{}",
-					PatchSet.humanSummary(self.__instanceMap, unappliedPatch))
+				return tryGetObjects(self.__instanceMap, self.__apiContext, unappliedPatch)
+					:andThen(function(finallyUnappliedPatch)
+						if not PatchSet.isEmpty(finallyUnappliedPatch) then
+							Log.warn("Could not apply all changes requested by the Rojo server:\n{}",
+								PatchSet.humanSummary(self.__instanceMap, finallyUnappliedPatch))
+						end
+					end)
 			end
 		end)
 end
@@ -271,18 +278,29 @@ end
 function ServeSession:__mainSyncLoop()
 	return self.__apiContext:retrieveMessages()
 		:andThen(function(messages)
+			local getObjectsPromises = {}
+
 			for _, message in ipairs(messages) do
 				local unappliedPatch = self.__reconciler:applyPatch(message)
 
 				if not PatchSet.isEmpty(unappliedPatch) then
-					Log.warn("Could not apply all changes requested by the Rojo server:\n{}",
-						PatchSet.humanSummary(self.__instanceMap, unappliedPatch))
+					table.insert(getObjectsPromises,
+						tryGetObjects(self.__instanceMap, self.__apiContext, unappliedPatch)
+							:andThen(function(finallyUnappliedPatch)
+								if not PatchSet.isEmpty(finallyUnappliedPatch) then
+									Log.warn("Could not apply all changes requested by the Rojo server:\n{}",
+										PatchSet.humanSummary(self.__instanceMap, finallyUnappliedPatch))
+								end
+							end)
+					)
 				end
 			end
 
-			if self.__status ~= Status.Disconnected then
-				return self:__mainSyncLoop()
-			end
+			return Promise.all(getObjectsPromises):andThen(function()
+				if self.__status ~= Status.Disconnected then
+					return self:__mainSyncLoop()
+				end
+			end)
 		end)
 end
 

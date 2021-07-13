@@ -1,0 +1,35 @@
+{
+  "name": "script-unwritable-instances",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "$path": "src"
+    },
+
+    "ServerStorage": {
+      "$className": "ServerStorage",
+
+      "UnwritableInProject": {
+        "$className": "MeshPart",
+        "$properties": {
+          "MeshId": "rbxassetid://4574885352"
+        }
+      },
+
+      "UnwritableInProjectWithChildren": {
+        "$className": "MeshPart",
+        "$properties": {
+          "MeshId": "rbxassetid://4574885352"
+        },
+        "Something": {
+          "$className": "NumberValue",
+          "$properties": {
+            "Value": 1000
+          }
+        }
+      }
+    }
+  }
+}
